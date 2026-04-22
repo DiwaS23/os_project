@@ -5,7 +5,7 @@ const MODEL_DESC={
   'one-to-one':'One-to-One: Each user thread has its own kernel thread. True parallelism. Used by Linux/Windows.',
   'many-to-many':'Many-to-Many: User threads multiplex onto a kernel thread pool. Best of both worlds.'
 };
-const ALGO_DESC={fcfs:' | FCFS: threads run to completion in arrival order.',rr:' | Round Robin: each thread gets a fixed time quantum before preemption.'};
+const ALGO_DESC={fcfs:' | FCFS: threads run to completion in arrival order.',sjf:' | SJF: Non-preemptive Shortest Job First. Shortest job runs to completion.'};
 
 let S={
   running:false, tick:0, threads:[], kthreads:[],
@@ -13,10 +13,8 @@ let S={
   interval:null, semCount:2, semMax:2,
   buffer:[], bufMax:6, prodCount:0,
   logs:[], ganttLog:[],
-  rrQueue:[],      // circular ready queue for RR (thread ids in order)
-  rrSlice:0,       // how many ticks current thread has run this quantum
-  quantum:2,       // time quantum for RR
-  currentRR:null,  // thread id currently running under RR
+  sjfQueue:[],     // ready queue for SJF (sorted by shortest burst time)
+  quantum:2,       // unused but kept for UI
   fcfsQueue:[]     // FIFO order of ready threads for FCFS
 };
 let speed=2;
@@ -46,13 +44,13 @@ function initState(){
   const n=5;
   S.threads=Array.from({length:n},(_,i)=>({
     id:'T'+(i+1), state:ST.N, burst:Math.floor(Math.random()*5)+3,
-    done:0, kid:null, arrivalOrder:i
+    done:0, kid:null, arrivalOrder:i, waitReason:null, hasSemaphore:false
   }));
   const km={'many-to-one':1,'one-to-one':n,'many-to-many':3}[S.model];
   S.kthreads=Array.from({length:km},(_,i)=>({id:'K'+(i+1),busy:false,tid:null}));
   S.semCount=S.semMax;
   S.buffer=[]; S.prodCount=0;
-  S.rrQueue=[]; S.rrSlice=0; S.currentRR=null;
+  S.sjfQueue=[];
   S.fcfsQueue=[];
   S.ganttLog=[];
   S.quantum=+document.getElementById('quantum-input').value||2;
@@ -67,8 +65,8 @@ function resetSim(){
   renderAll();
   log('Simulator reset.','info');
   document.getElementById('mdesc').textContent=(MODEL_DESC[S.model]||'')+(ALGO_DESC[S.algo]||'');
-  document.getElementById('algo-badge-wrap').innerHTML=`<span class="algo-badge">${S.algo==='fcfs'?'FCFS':'Round Robin (q='+S.quantum+')'}</span>`;
-  document.getElementById('q-order-lbl').textContent=S.algo==='fcfs'?'(FIFO order)':'(circular)';
+  document.getElementById('algo-badge-wrap').innerHTML=`<span class="algo-badge">${S.algo==='fcfs'?'FCFS':'SJF'}</span>`;
+  document.getElementById('q-order-lbl').textContent=S.algo==='fcfs'?'(FIFO order)':'(shortest burst)';
   renderGantt();
 }
 
@@ -89,7 +87,8 @@ function toggleSim(){
       if(S.algo==='fcfs'){
         S.fcfsQueue=S.threads.map(t=>t.id);
       } else {
-        S.rrQueue=S.threads.map(t=>t.id);
+        S.sjfQueue=S.threads.map(t=>t.id);
+        sortSJFQueue();
       }
     }
     S.interval=setInterval(tick,getDelay());
@@ -100,64 +99,129 @@ function toggleSim(){
 function tick(){
   S.tick++;
   if(S.algo==='fcfs') doFCFS();
-  else doRR();
-  updateSync();
+  else doSJF();
   renderAll();
   updateStats();
+}
+
+function wakeUpOne(reason) {
+  const t = S.threads.find(t => t.state === ST.W && t.waitReason === reason);
+  if (t) {
+    t.state = ST.R;
+    t.waitReason = null;
+    if (S.algo === 'sjf') {
+      if(!S.sjfQueue.includes(t.id)) S.sjfQueue.push(t.id);
+    } else {
+      if(!S.fcfsQueue.includes(t.id)) S.fcfsQueue.push(t.id);
+    }
+    log(t.id + ' woke up (' + reason + ') → ready queue', 'info');
+  }
 }
 
 // ---- FCFS scheduling ----
 function doFCFS(){
   const {threads,kthreads,model}=S;
+  const maxConcurrent={'many-to-one':1,'one-to-one':5,'many-to-many':3}[model];
 
-  // Advance running threads one step
+  threads.filter(t=>t.state===ST.R && t.kid).forEach(t=>{
+    t.state = ST.X;
+    log(t.id + ' resumed execution on ' + t.kid, 'sched');
+  });
+
   threads.filter(t=>t.state===ST.X).forEach(t=>{
     t.done++;
     S.ganttLog.push({id:t.id,tick:S.tick});
+
+    let blockedSync = false;
+    if (S.sync === 'monitor') {
+      const isProd = (t.id === 'T2' || t.id === 'T4');
+      if (isProd) {
+        if (S.buffer.length >= S.bufMax) {
+          blockedSync = true;
+          t.waitReason = 'monitor_prod';
+        } else if (Math.random() < 0.2) {
+          S.buffer.push(++S.prodCount % 9 + 1);
+          wakeUpOne('monitor_cons');
+          log('Producer '+t.id+' added item','info');
+        }
+      } else {
+        if (S.buffer.length <= 0) {
+          blockedSync = true;
+          t.waitReason = 'monitor_cons';
+        } else if (Math.random() < 0.2) {
+          S.buffer.shift();
+          wakeUpOne('monitor_prod');
+          log('Consumer '+t.id+' removed item','info');
+        }
+      }
+    }
+
+    if (blockedSync) {
+      t.state = ST.W;
+      freeKernel(t); 
+      log(t.id + ' blocked on Monitor condition → waiting', 'warn');
+      return;
+    }
+
+    if (Math.random() < 0.05) {
+      t.state = ST.W;
+      t.waitReason = 'io';
+      if (S.model !== 'many-to-one') freeKernel(t);
+      log(t.id + ' requested I/O → waiting queue', 'warn');
+      return;
+    }
+
     if(t.done>=t.burst){
       t.state=ST.T;
       freeKernel(t);
-      log(t.id+' completed execution → Terminated','ok');
-      // Remove from fcfsQueue if still there
       S.fcfsQueue=S.fcfsQueue.filter(id=>id!==t.id);
+      
+      if (S.sync === 'semaphore' && t.hasSemaphore) {
+        S.semCount++;
+        t.hasSemaphore = false;
+        wakeUpOne('semaphore');
+      }
+      log(t.id+' completed execution → Terminated','ok');
     }
   });
 
-  // Unblock some waiting threads (I/O done)
-  threads.filter(t=>t.state===ST.W).forEach(t=>{
+  threads.filter(t=>t.state===ST.W && t.waitReason==='io').forEach(t=>{
     if(Math.random()<0.3){
       t.state=ST.R;
-      // Re-add to tail of FCFS queue
+      t.waitReason=null;
       if(!S.fcfsQueue.includes(t.id)) S.fcfsQueue.push(t.id);
-      log(t.id+' woke up from I/O → moved to ready queue','info');
+      log(t.id+' woke up from I/O → ready queue','info');
     }
   });
 
-  // Randomly block a ready thread (I/O request) — not in many-to-one during run
-  const readyList=threads.filter(t=>t.state===ST.R);
-  if(readyList.length>1&&Math.random()<0.12){
-    const victim=readyList[Math.floor(Math.random()*readyList.length)];
-    victim.state=ST.W;
-    S.fcfsQueue=S.fcfsQueue.filter(id=>id!==victim.id);
-    freeKernel(victim);
-    log(victim.id+' requested I/O → moved to waiting queue','warn');
-  }
-
-  // FCFS: schedule next in queue if CPU/kernel is free
   const runningCount=threads.filter(t=>t.state===ST.X).length;
-  const maxConcurrent={'many-to-one':1,'one-to-one':5,'many-to-many':3}[model];
-
   if(runningCount<maxConcurrent){
     const freeSlots=maxConcurrent-runningCount;
     const freeKernels=kthreads.filter(k=>!k.busy);
-    // Pick from front of FCFS queue
+    
     for(let i=0;i<Math.min(freeSlots,freeKernels.length);i++){
       const nextId=S.fcfsQueue.find(id=>{
         const t=threads.find(t=>t.id===id);
-        return t&&t.state===ST.R;
+        if(!t||t.state!==ST.R) return false;
+        if(S.sync==='semaphore' && !t.hasSemaphore) {
+          if(S.semCount>0) return true;
+          else {
+            t.state=ST.W;
+            t.waitReason='semaphore';
+            log(t.id+' failed to acquire semaphore → waiting','warn');
+            return false;
+          }
+        }
+        return true;
       });
       if(!nextId) break;
       const t=threads.find(t=>t.id===nextId);
+      
+      if(S.sync==='semaphore' && !t.hasSemaphore) {
+        S.semCount--;
+        t.hasSemaphore=true;
+      }
+      
       const k=freeKernels[i];
       if(t&&k){
         t.state=ST.X; t.kid=k.id;
@@ -170,84 +234,134 @@ function doFCFS(){
   respawnIfDone();
 }
 
-// ---- Round Robin scheduling ----
-function doRR(){
+// ---- SJF scheduling ----
+function doSJF(){
   const {threads,kthreads,model}=S;
   const maxConcurrent={'many-to-one':1,'one-to-one':5,'many-to-many':3}[model];
 
-  // Track running threads and advance them
+  threads.filter(t=>t.state===ST.R && t.kid).forEach(t=>{
+    t.state = ST.X;
+    log(t.id + ' resumed execution on ' + t.kid, 'sched');
+  });
+
   threads.filter(t=>t.state===ST.X).forEach(t=>{
     t.done++;
     S.ganttLog.push({id:t.id,tick:S.tick});
+
+    let blockedSync = false;
+    if (S.sync === 'monitor') {
+      const isProd = (t.id === 'T2' || t.id === 'T4');
+      if (isProd) {
+        if (S.buffer.length >= S.bufMax) {
+          blockedSync = true;
+          t.waitReason = 'monitor_prod';
+        } else if (Math.random() < 0.2) {
+          S.buffer.push(++S.prodCount % 9 + 1);
+          wakeUpOne('monitor_cons');
+          log('Producer '+t.id+' added item','info');
+        }
+      } else {
+        if (S.buffer.length <= 0) {
+          blockedSync = true;
+          t.waitReason = 'monitor_cons';
+        } else if (Math.random() < 0.2) {
+          S.buffer.shift();
+          wakeUpOne('monitor_prod');
+          log('Consumer '+t.id+' removed item','info');
+        }
+      }
+    }
+
+    if (blockedSync) {
+      t.state = ST.W;
+      freeKernel(t); 
+      log(t.id + ' blocked on Monitor condition → waiting', 'warn');
+      return;
+    }
+
+    if (Math.random() < 0.05) {
+      t.state = ST.W;
+      t.waitReason = 'io';
+      if (S.model !== 'many-to-one') freeKernel(t);
+      log(t.id + ' requested I/O → waiting queue', 'warn');
+      return;
+    }
+
     if(t.done>=t.burst){
       t.state=ST.T;
       freeKernel(t);
-      S.rrQueue=S.rrQueue.filter(id=>id!==t.id);
-      if(S.currentRR===t.id) S.currentRR=null;
-      S.rrSlice=0;
-      log(t.id+' completed its burst → Terminated','ok');
+      S.sjfQueue=S.sjfQueue.filter(id=>id!==t.id);
+      
+      if (S.sync === 'semaphore' && t.hasSemaphore) {
+        S.semCount++;
+        t.hasSemaphore = false;
+        wakeUpOne('semaphore');
+      }
+      log(t.id+' completed execution → Terminated','ok');
     }
   });
-  S.rrSlice++;
 
-  // Unblock waiting threads
-  threads.filter(t=>t.state===ST.W).forEach(t=>{
+  threads.filter(t=>t.state===ST.W && t.waitReason==='io').forEach(t=>{
     if(Math.random()<0.3){
       t.state=ST.R;
-      if(!S.rrQueue.includes(t.id)) S.rrQueue.push(t.id);
-      log(t.id+' woke up → added to tail of RR queue','info');
+      t.waitReason=null;
+      if(!S.sjfQueue.includes(t.id)) S.sjfQueue.push(t.id);
+      log(t.id+' woke up from I/O → ready queue','info');
     }
   });
 
-  // Randomly block a ready thread
-  const readyList=threads.filter(t=>t.state===ST.R&&t.id!==S.currentRR);
-  if(readyList.length>0&&Math.random()<0.1){
-    const victim=readyList[Math.floor(Math.random()*readyList.length)];
-    victim.state=ST.W;
-    S.rrQueue=S.rrQueue.filter(id=>id!==victim.id);
-    freeKernel(victim);
-    log(victim.id+' blocked on I/O → waiting queue','warn');
-  }
+  sortSJFQueue();
 
-  // Check if quantum expired for current running thread
-  if(S.rrSlice>=S.quantum){
-    const runningThreads=threads.filter(t=>t.state===ST.X);
-    runningThreads.forEach(t=>{
-      if(t.state===ST.X){
-        t.state=ST.R;
-        freeKernel(t);
-        // Move to tail of RR queue (circular)
-        S.rrQueue=S.rrQueue.filter(id=>id!==t.id);
-        S.rrQueue.push(t.id);
-        log(t.id+' preempted after quantum of '+S.quantum+' → back to ready queue','sched');
+  const runningCount=threads.filter(t=>t.state===ST.X).length;
+  if(runningCount<maxConcurrent){
+    const freeSlots=maxConcurrent-runningCount;
+    const freeKernels=kthreads.filter(k=>!k.busy);
+    
+    for(let i=0;i<Math.min(freeSlots,freeKernels.length);i++){
+      const nextId=S.sjfQueue.find(id=>{
+        const t=threads.find(t=>t.id===id);
+        if(!t||t.state!==ST.R) return false;
+        if(S.sync==='semaphore' && !t.hasSemaphore) {
+          if(S.semCount>0) return true;
+          else {
+            t.state=ST.W;
+            t.waitReason='semaphore';
+            log(t.id+' failed to acquire semaphore → waiting','warn');
+            return false;
+          }
+        }
+        return true;
+      });
+      if(!nextId) break;
+      const t=threads.find(t=>t.id===nextId);
+      
+      if(S.sync==='semaphore' && !t.hasSemaphore) {
+        S.semCount--;
+        t.hasSemaphore=true;
       }
-    });
-    S.rrSlice=0;
-    S.currentRR=null;
-  }
-
-  // Schedule threads from front of circular RR queue
-  const freeKernels=kthreads.filter(k=>!k.busy);
-  const runningNow=threads.filter(t=>t.state===ST.X).length;
-  const slots=maxConcurrent-runningNow;
-
-  for(let i=0;i<Math.min(slots,freeKernels.length);i++){
-    const nextId=S.rrQueue.find(id=>{
-      const t=threads.find(t=>t.id===id);
-      return t&&t.state===ST.R;
-    });
-    if(!nextId) break;
-    const t=threads.find(t=>t.id===nextId);
-    const k=freeKernels[i];
-    if(t&&k){
-      t.state=ST.X; t.kid=k.id;
-      k.busy=true; k.tid=t.id;
-      S.currentRR=t.id;
-      log(t.id+' started time slice on '+k.id+' [RR, q='+S.quantum+']','sched');
+      
+      const k=freeKernels[i];
+      if(t&&k){
+        t.state=ST.X; t.kid=k.id;
+        k.busy=true; k.tid=t.id;
+        log(t.id+' started execution on '+k.id+' [SJF]','sched');
+      }
     }
   }
 
   respawnIfDone();
+}
+
+function sortSJFQueue() {
+  S.sjfQueue.sort((a, b) => {
+    const tA = S.threads.find(t => t.id === a);
+    const tB = S.threads.find(t => t.id === b);
+    if (!tA || !tB) return 0;
+    const remA = tA.burst - tA.done;
+    const remB = tB.burst - tB.done;
+    if (remA !== remB) return remA - remB;
+    return tA.arrivalOrder - tB.arrivalOrder;
+  });
 }
 
 function freeKernel(t){
@@ -265,28 +379,13 @@ function respawnIfDone(){
     S.threads.forEach(t=>{
       t.state=ST.R; t.done=0;
       t.burst=Math.floor(Math.random()*5)+3; t.kid=null;
+      t.waitReason=null; t.hasSemaphore=false;
     });
     S.kthreads.forEach(k=>{k.busy=false;k.tid=null;});
-    S.rrSlice=0; S.currentRR=null;
+    S.semCount = S.semMax;
+    S.buffer = []; S.prodCount = 0;
     if(S.algo==='fcfs') S.fcfsQueue=S.threads.map(t=>t.id);
-    else S.rrQueue=S.threads.map(t=>t.id);
-  }
-}
-
-function updateSync(){
-  if(S.sync==='semaphore'){
-    const runCnt=S.threads.filter(t=>t.state===ST.X).length;
-    S.semCount=Math.max(0,S.semMax-Math.min(runCnt,S.semMax));
-  } else {
-    if(S.buffer.length<S.bufMax&&Math.random()<0.4){
-      const item=++S.prodCount%9+1;
-      S.buffer.push(item);
-      log('Producer added item '+item+' → buffer ['+S.buffer.length+'/'+S.bufMax+']','info');
-    }
-    if(S.buffer.length>0&&Math.random()<0.3){
-      const v=S.buffer.shift();
-      log('Consumer removed item '+v+' → buffer ['+S.buffer.length+'/'+S.bufMax+']','info');
-    }
+    else { S.sjfQueue=S.threads.map(t=>t.id); sortSJFQueue(); }
   }
 }
 
@@ -360,11 +459,10 @@ function renderCPU(){
   if(!running.length){el.innerHTML='<div style="color:var(--muted);font-size:11px">CPU idle</div>';return;}
   el.innerHTML=running.map(t=>{
     const pct=Math.round((t.done/t.burst)*100);
-    const sliceInfo=S.algo==='rr'?' | slice '+S.rrSlice+'/'+S.quantum:'';
     return`<div class="cpu-row">
       <div class="dot"></div>
       <span style="font-size:11px">${t.id} → ${t.kid||'?'}</span>
-      <span style="font-size:10px;color:var(--muted);margin-left:auto">${pct}%${sliceInfo}</span>
+      <span style="font-size:10px;color:var(--muted);margin-left:auto">${pct}%</span>
     </div>`;
   }).join('');
 }
@@ -375,12 +473,12 @@ function renderQueues(){
   // Show queue in scheduled order
   const orderedRQ=S.algo==='fcfs'
     ? S.fcfsQueue.map(id=>rq.find(t=>t.id===id)).filter(Boolean)
-    : S.rrQueue.map(id=>rq.find(t=>t.id===id)).filter(Boolean);
+    : S.sjfQueue.map(id=>rq.find(t=>t.id===id)).filter(Boolean);
   document.getElementById('ready-queue').innerHTML=
     orderedRQ.map(t=>`<div class="qi qr">${t.id}</div>`).join('')||
     '<span style="font-size:10px;color:var(--muted)">empty</span>';
   document.getElementById('wait-queue').innerHTML=
-    wq.map(t=>`<div class="qi qw">${t.id}</div>`).join('')||
+    wq.map(t=>`<div class="qi qw" title="${t.waitReason?'Waiting for: '+t.waitReason:''}">${t.id}${t.waitReason?` <span style="font-size:8px;opacity:.7">(${t.waitReason.split('_')[0].slice(0,3)})</span>`:''}</div>`).join('')||
     '<span style="font-size:10px;color:var(--muted)">empty</span>';
 }
 
@@ -390,22 +488,24 @@ function renderSync(){
   if(S.sync==='semaphore'){
     title.textContent='Semaphore';
     const pct=Math.round((S.semCount/S.semMax)*100);
-    const wq=S.threads.filter(t=>t.state===ST.W);
+    const wq=S.threads.filter(t=>t.state===ST.W && t.waitReason==='semaphore');
     el.innerHTML=`<div style="font-size:11px;color:var(--muted);margin-bottom:4px">Slots available: <span style="color:var(--purple);font-weight:500">${S.semCount}/${S.semMax}</span></div>
     <div class="sem-bar"><div class="sem-fill" style="width:${pct}%"></div></div>
-    <div style="font-size:10px;color:var(--muted);margin-top:5px">Blocked:</div>
+    <div style="font-size:10px;color:var(--muted);margin-top:5px">Blocked on Semaphore:</div>
     <div class="qrow" style="margin-top:3px">${wq.map(t=>`<div class="qi qw">${t.id}</div>`).join('')||'<span style="font-size:10px;color:var(--muted)">none</span>'}</div>`;
   } else {
     title.textContent='Monitor (Producer-Consumer)';
     const cells=Array.from({length:S.bufMax},(_,i)=>
       i<S.buffer.length?`<div class="bc bf">${S.buffer[i]}</div>`:`<div class="bc be"></div>`).join('');
     const pct=Math.round((S.buffer.length/S.bufMax)*100);
+    const pwq = S.threads.filter(t=>t.state===ST.W && t.waitReason==='monitor_prod').length;
+    const cwq = S.threads.filter(t=>t.state===ST.W && t.waitReason==='monitor_cons').length;
     el.innerHTML=`<div style="font-size:11px;color:var(--muted);margin-bottom:3px">Buffer: <span style="color:var(--teal);font-weight:500">${S.buffer.length}/${S.bufMax}</span></div>
     <div class="buf-row">${cells}</div>
     <div class="sem-bar"><div class="sem-fill" style="width:${pct}%;background:var(--teal)"></div></div>
     <div style="display:flex;gap:10px;margin-top:4px;font-size:10px">
-      <div style="color:var(--muted)">Producer: <span style="color:var(--green);font-weight:500">${S.buffer.length<S.bufMax?'active':'blocked'}</span></div>
-      <div style="color:var(--muted)">Consumer: <span style="color:var(--orange);font-weight:500">${S.buffer.length>0?'active':'blocked'}</span></div>
+      <div style="color:var(--muted)">Producers: <span style="color:var(--green);font-weight:500">${pwq===0?'active':pwq+' blocked'}</span></div>
+      <div style="color:var(--muted)">Consumers: <span style="color:var(--orange);font-weight:500">${cwq===0?'active':cwq+' blocked'}</span></div>
     </div>`;
   }
 }
@@ -465,7 +565,6 @@ function updateStats(){
   document.getElementById('s-rdy').textContent=S.threads.filter(t=>t.state===ST.R).length;
   document.getElementById('s-wait').textContent=S.threads.filter(t=>t.state===ST.W).length;
   document.getElementById('s-done').textContent=S.threads.filter(t=>t.state===ST.T).length;
-  if(S.algo==='rr') document.getElementById('s-slice').textContent=S.rrSlice+'/'+S.quantum;
 }
 
 function log(msg,type=''){
@@ -477,3 +576,9 @@ function log(msg,type=''){
 }
 
 resetSim();
+
+const rrOption = document.querySelector('#algo-sel option[value="rr"]');
+if (rrOption) {
+  rrOption.value = 'sjf';
+  rrOption.textContent = 'SJF';
+}
